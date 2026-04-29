@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>BikeTrack Pro - Private Navi</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <style>
+        /* Mobile First & Dark Mode */
+        :root {
+            --bg-color: #121212;
+            --panel-bg: rgba(30, 30, 30, 0.9);
+            --text: #ffffff;
+            --primary: #00e676; /* Neon Grün */
+            --danger: #ff1744;  /* Neon Rot */
+            --accent: #2979ff;  /* Neon Blau */
+        }
+
+        body, html {
+            margin: 0; padding: 0;
+            height: 100%; width: 100%;
+            background-color: var(--bg-color);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            overflow: hidden;
+        }
+
+        /* Map Container */
+        #map {
+            height: 100%; width: 100%;
+            z-index: 1;
+        }
+
+        /* Dashboard UI */
+        #dashboard {
+            position: absolute;
+            top: 10px; left: 10px; right: 10px;
+            background: var(--panel-bg);
+            backdrop-filter: blur(5px);
+            border-radius: 12px;
+            padding: 15px;
+            z-index: 1000;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            text-align: center;
+        }
+
+        .stat-box {
+            display: flex; flex-direction: column;
+        }
+
+        .stat-value {
+            font-size: 1.5rem; font-weight: bold;
+        }
+
+        .stat-label {
+            font-size: 0.75rem; color: #aaa; text-transform: uppercase;
+        }
+
+        /* Controls Bottom */
+        #controls {
+            position: absolute;
+            bottom: 20px; left: 10px; right: 10px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .btn-row {
+            display: flex; gap: 10px; width: 100%;
+        }
+
+        button {
+            flex: 1;
+            padding: 18px;
+            font-size: 1.1rem;
+            font-weight: bold;
+            border: none;
+            border-radius: 12px;
+            color: white;
+            background-color: #333;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+            cursor: pointer;
+            transition: transform 0.1s;
+        }
+        
+        button:active { transform: scale(0.95); }
+        .btn-start { background-color: var(--primary); color: #000; }
+        .btn-stop { background-color: var(--danger); }
+        .btn-export { background-color: var(--accent); }
+
+        /* Status & Planning tools */
+        #toolbar {
+            position: absolute;
+            top: 100px; left: 10px;
+            background: var(--panel-bg);
+            padding: 10px;
+            border-radius: 8px;
+            z-index: 1000;
+            font-size: 0.9rem;
+        }
+
+        /* Leaflet Dark Mode Overrides */
+        .leaflet-control-layers-expanded { background: var(--panel-bg) !important; color: white; border: none; }
+        .leaflet-bar a { background-color: var(--panel-bg) !important; color: white !important; border-bottom: 1px solid #444 !important; }
+    </style>
+</head>
+<body>
+
+    <div id="dashboard">
+        <div class="stat-box">
+            <span class="stat-value" id="val-dist">0.0</span>
+            <span class="stat-label">Distanz (km)</span>
+        </div>
+        <div class="stat-box">
+            <span class="stat-value" id="val-speed">0.0</span>
+            <span class="stat-label">km/h</span>
+        </div>
+        <div class="stat-box">
+            <span class="stat-value" id="val-time">00:00</span>
+            <span class="stat-label">Fahrzeit</span>
+        </div>
+        <div class="stat-box">
+            <span class="stat-value" id="val-alt">--</span>
+            <span class="stat-label">Höhenmeter</span>
+        </div>
+        <div class="stat-box">
+            <span class="stat-value" id="val-avg">0.0</span>
+            <span class="stat-label">Ø km/h</span>
+        </div>
+        <div class="stat-box">
+            <span class="stat-value" id="val-kcal">0</span>
+            <span class="stat-label">Kcal</span>
+        </div>
+    </div>
+
+    <div id="toolbar">
+        <label><input type="checkbox" id="chk-offroad"> Weglos (Luftlinie)</label><br>
+        <small>Langer Druck auf Karte = Wegpunkt</small><br>
+        <button onclick="clearRoute()" style="padding: 5px 10px; margin-top: 5px; font-size: 0.8rem;">Route löschen</button>
+    </div>
+
+    <div id="map"></div>
+
+    <div id="controls">
+        <div class="btn-row">
+            <button class="btn-start" id="btn-start" onclick="toggleTracking()">▶ START</button>
+            <button class="btn-export" onclick="exportGPX()">💾 GPX Export</button>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        // --- 1. KARTEN- SETUP ---
+        const map = L.map('map', { zoomControl: false }).setView([51.165691, 10.451526], 6); // Default GER
+        L.control.zoom({ position: 'topright' }).addTo(map);
+
+        // Layer 1: OpenTopoMap (Waldwege-Modus)
+        const topoLayer = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+            maxZoom: 17,
+            attribution: '© OpenTopoMap'
+        }).addTo(map);
+
+        // Layer 2: Esri Satellite (Foto-Modus)
+        const satLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: '© Esri'
+        });
+
+        // Layer-Switcher
+        L.control.layers({
+            "Waldwege (Topo)": topoLayer,
+            "Satellit (Foto)": satLayer
+        }).addTo(map);
+
+        // --- 2. AUTO-STANDORT (10km Fokus) ---
+        map.locate({setView: true, maxZoom: 13, enableHighAccuracy: true});
+        let userMarker = null;
+
+        map.on('locationfound', function(e) {
+            if(!userMarker) {
+                userMarker = L.circleMarker(e.latlng, {radius: 8, color: '#2979ff', fillColor: '#2979ff', fillOpacity: 0.8}).addTo(map);
+            } else {
+                userMarker.setLatLng(e.latlng);
+            }
+        });
+
+        // --- 3. ROUTENPLANUNG ---
+        let waypoints = [];
+        let planLayer = L.featureGroup().addTo(map);
+        
+        // Touch-Logik für langen Druck (Mobile First)
+        let touchTimer;
+        map.on('touchstart', (e) => { touchTimer = setTimeout(() => addWaypoint(e.latlng), 600); });
+        map.on('touchend touchmove', () => clearTimeout(touchTimer));
+        map.on('contextmenu', (e) => addWaypoint(e.latlng)); // Desktop Rechtsklick
+
+        function addWaypoint(latlng) {
+            waypoints.push(latlng);
+            L.circleMarker(latlng, {radius: 5, color: '#ff1744'}).addTo(planLayer);
+            calculateRoute();
+        }
+
+        function clearRoute() {
+            waypoints = [];
+            planLayer.clearLayers();
+            document.getElementById('val-alt').innerText = "--";
+        }
+
+        async function calculateRoute() {
+            if(waypoints.length < 2) return;
+            
+            const isOffroad = document.getElementById('chk-offroad').checked;
+            planLayer.clearLayers();
+            
+            // Wegpunkte neu zeichnen
+            waypoints.forEach(wp => L.circleMarker(wp, {radius: 5, color: '#ff1744'}).addTo(planLayer));
+
+            if(isOffroad) {
+                // Luftlinie
+                L.polyline(waypoints, {color: '#ff1744', dashArray: '5, 5'}).addTo(planLayer);
+            } else {
+                // OSRM Bicycle Routing API
+                const coords = waypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+                try {
+                    const res = await fetch(`https://router.project-osrm.org/route/v1/bicycle/${coords}?geometries=geojson`);
+                    const data = await res.json();
+                    if(data.routes && data.routes.length > 0) {
+                        const geojson = data.routes[0].geometry;
+                        // Zeichne Route (Standard)
+                        const routeLine = L.geoJSON(geojson, {style: {color: '#00e676', weight: 5, opacity: 0.8}}).addTo(planLayer);
+                        
+                        // Elevation Check (simulierte Heatmap wegen API-Limits)
+                        fetchElevation(data.routes[0].distance);
+                    }
+                } catch(err) {
+                    console.error("Routing Fehler:", err);
+                    alert("Kein Weg gefunden. Probiere 'Weglos'.");
+                }
+            }
+        }
+
+        // --- 4. ANALYSE & ELEVATION ---
+        async function fetchElevation(distanceInMeters) {
+            // Open-Elevation API für Gesamt-Höhenmeter (vereinfacht, fragt nur Start/Ziel wegen API Limits)
+            if(waypoints.length < 2) return;
+            const start = waypoints[0];
+            const end = waypoints[waypoints.length-1];
+            
+            try {
+                const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
+                    method: 'POST',
+                    headers: {'Accept': 'application/json', 'Content-Type': 'application/json'},
+                    body: JSON.stringify({locations: [{latitude: start.lat, longitude: start.lng}, {latitude: end.lat, longitude: end.lng}]})
+                });
+                const data = await res.json();
+                if(data && data.results) {
+                    let diff = Math.abs(data.results[1].elevation - data.results[0].elevation);
+                    document.getElementById('val-alt').innerText = `${Math.round(diff)}m`;
+                }
+            } catch(err) {
+                console.log("Elevation API Fehler:", err);
+            }
+        }
+
+        // --- 5. LIVE TRACKING & HEATMAP ---
+        let isTracking = false;
+        let watchId = null;
+        let trackPoints = []; // [{lat, lng, time, speed, ele}]
+        let trackLayer = L.featureGroup().addTo(map);
+        
+        // Stats
+        let totalDist = 0; // in km
+        let movingTime = 0; // in seconds
+        let totalTime = 0;
+        let timerInterval = null;
+        let lastPos = null;
+
+        function toggleTracking() {
+            const btn = document.getElementById('btn-start');
+            if(!isTracking) {
+                // START
+                isTracking = true;
+                btn.innerHTML = "⏹ STOP";
+                btn.className = "btn-stop";
+                
+                trackPoints = [];
+                trackLayer.clearLayers();
+                totalDist = 0; movingTime = 0; totalTime = 0; lastPos = null;
+                
+                // Timer
+                timerInterval = setInterval(() => {
+                    totalTime++;
+                    document.getElementById('val-time').innerText = formatTime(totalTime);
+                }, 1000);
+
+                // GPS Tracking
+                if(navigator.geolocation) {
+                    watchId = navigator.geolocation.watchPosition(updatePosition, err => console.log(err), {
+                        enableHighAccuracy: true, maximumAge: 1000, timeout: 5000
+                    });
+                } else {
+                    alert("GPS wird vom Browser nicht unterstützt.");
+                }
+
+            } else {
+                // STOP
+                isTracking = false;
+                btn.innerHTML = "▶ START";
+                btn.className = "btn-start";
+                clearInterval(timerInterval);
+                if(watchId) navigator.geolocation.clearWatch(watchId);
+            }
+        }
+
+        function updatePosition(pos) {
+            const currentPos = L.latLng(pos.coords.latitude, pos.coords.longitude);
+            const speedMs = pos.coords.speed || 0; 
+            const speedKmh = speedMs * 3.6;
+
+            // UI Update Live
+            document.getElementById('val-speed').innerText = speedKmh.toFixed(1);
+
+            // Brotkrümel-Logik: Nur updaten wenn > 5 Meter bewegt
+            if(lastPos) {
+                const distMeters = lastPos.distanceTo(currentPos);
+                if(distMeters < 5) return; // GPS Zittern filtern
+
+                // Update Distanz & Zeit
+                totalDist += (distMeters / 1000);
+                movingTime += (totalTime - (trackPoints[trackPoints.length-1].time || totalTime));
+                
+                // Speed Heatmap zeichnen (Linie vom letzten zum aktuellen Punkt)
+                const color = getSpeedColor(speedKmh);
+                L.polyline([lastPos, currentPos], {color: color, weight: 6, opacity: 0.9}).addTo(trackLayer);
+            }
+
+            // Punkt speichern für Export
+            trackPoints.push({
+                lat: currentPos.lat,
+                lng: currentPos.lng,
+                ele: pos.coords.altitude || 0,
+                time: new Date().toISOString(),
+                speed: speedKmh
+            });
+
+            lastPos = currentPos;
+            if(userMarker) userMarker.setLatLng(currentPos);
+            map.panTo(currentPos); // Auto-Follow
+
+            updateDashboard();
+        }
+
+        function getSpeedColor(kmh) {
+            if(kmh < 5) return '#2979ff';  // Blau (Langsam)
+            if(kmh < 15) return '#00e676'; // Grün (Normal)
+            if(kmh < 25) return '#ffea00'; // Gelb (Flott)
+            return '#ff1744';              // Rot (Schnell/Abfahrt)
+        }
+
+        function updateDashboard() {
+            document.getElementById('val-dist').innerText = totalDist.toFixed(2);
+            
+            // Durchschnittsgeschwindigkeit (nur in Bewegung)
+            const movingHours = movingTime / 3600;
+            if(movingHours > 0) {
+                document.getElementById('val-avg').innerText = (totalDist / movingHours).toFixed(1);
+            }
+
+            // Kalorien-Schätzung (Sehr grobe Formel: Distanz * Gewichtsfaktor. Annahme: 75kg)
+            const kcal = Math.round(totalDist * 75 * 0.4);
+            document.getElementById('val-kcal').innerText = kcal;
+        }
+
+        function formatTime(seconds) {
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            if(h > 0) return `${h}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+            return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+        }
+
+        // --- 6. GPX EXPORT ---
+        function exportGPX() {
+            if(trackPoints.length === 0) {
+                alert("Keine aufgezeichneten Daten vorhanden.");
+                return;
+            }
+
+            let gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="BikeTrack Pro" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>BikeTrack Tour ${new Date().toLocaleDateString()}</name>
+    <trkseg>`;
+
+            trackPoints.forEach(p => {
+                gpx += `
+      <trkpt lat="${p.lat}" lon="${p.lng}">
+        <ele>${p.ele}</ele>
+        <time>${p.time}</time>
+      </trkpt>`;
+            });
+
+            gpx += `
+    </trkseg>
+  </trk>
+</gpx>`;
+
+            const blob = new Blob([gpx], {type: 'application/gpx+xml'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.style.display = 'none';
+            a.href = url;
+            a.download = `Tour_${new Date().toISOString().slice(0,10)}.gpx`;
+            document.body.appendChild(a);
+            a.click();
+            URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+        }
+    </script>
+</body>
+</html>
