@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>BikeNavi Ultimate Heatmap</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.css" />
+    
+    <style>
+        :root { --bg: #121212; --card: #1e1e1e; --accent: #28a745; --text: #e0e0e0; --danger: #dc3545; }
+        body, html { margin: 0; padding: 0; height: 100%; width: 100%; font-family: sans-serif; background: var(--bg); color: var(--text); overflow: hidden; }
+        #map { height: 60%; width: 100%; }
+        #ui-container { height: 40%; display: flex; flex-direction: column; padding: 15px; box-sizing: border-box; background: var(--card); border-top: 2px solid var(--accent); }
+        .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 10px; }
+        .stat-card { background: #2a2a2a; padding: 8px 5px; border-radius: 10px; text-align: center; border: 1px solid #333; }
+        .stat-label { font-size: 0.6rem; color: #888; display: block; text-transform: uppercase; }
+        .stat-value { font-size: 1rem; font-weight: bold; color: var(--accent); }
+        .controls-row { display: flex; gap: 8px; margin-bottom: 8px; }
+        button { flex: 1; border: none; border-radius: 10px; padding: 12px 5px; font-weight: bold; color: white; cursor: pointer; font-size: 0.8rem; }
+        .btn-plan { background: #444; } .btn-start { background: var(--accent); } .btn-stop { background: var(--danger); } .btn-gpx { background: #007bff; }
+        #status-bar { font-size: 0.7rem; text-align: center; color: #ffc107; margin-top: auto; }
+        .leaflet-routing-container { display: none !important; }
+        .leaflet-control-layers { background: #333 !important; color: white !important; border: none !important; }
+    </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="ui-container">
+    <div class="stats-grid">
+        <div class="stat-card"><span class="stat-label">Distanz</span><span id="dist" class="stat-value">0.0</span> km</div>
+        <div class="stat-card"><span class="stat-label">Höhe/Speed</span><span id="ele-speed" class="stat-value">0</span></div>
+        <div class="stat-card"><span class="stat-label">Zeit</span><span id="time" class="stat-value">00:00</span></div>
+    </div>
+    <div class="controls-row">
+        <button class="btn-plan" onclick="resetAll()">🔄 Reset</button>
+        <button id="startBtn" class="btn-start" onclick="startTracking()">▶ Start Tour</button>
+    </div>
+    <div class="controls-row">
+        <button class="btn-stop" onclick="stopTracking()">⏹ Stop</button>
+        <button class="btn-gpx" onclick="exportGPX()">💾 GPX</button>
+    </div>
+    <div id="status-bar">Planung: Grün=Flach, Rot=Steil | Fahrt: Blau=Langsam, Rot=Schnell</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-routing-machine@latest/dist/leaflet-routing-machine.js"></script>
+
+<script>
+    let map, routingControl, trackPath = [], isRecording = false;
+    let startTime, timerInterval, totalDist = 0, lastPos = null;
+    let plannedHeatmapLayer = L.layerGroup();
+
+    // 1. Karten-Setup (Waldwege & Satellit)
+    const topoMap = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png');
+    const satelliteMap = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}');
+
+    map = L.map('map', { layers: [topoMap], zoomControl: false });
+    L.control.layers({"Waldwege": topoMap, "Foto": satelliteMap}).addTo(map);
+    plannedHeatmapLayer.addTo(map);
+
+    map.locate({setView: true, maxZoom: 13});
+
+    // 2. Heatmap-Logik Farben
+    function getSpeedColor(ms) {
+        const kmh = ms * 3.6;
+        if (kmh < 10) return "#0000ff"; // Blau
+        if (kmh < 20) return "#00ff00"; // Grün
+        if (kmh < 30) return "#ffff00"; // Gelb
+        return "#ff0000";               // Rot
+    }
+
+    function getGradeColor(grade) {
+        if (grade < 2) return "#28a745"; // Flach
+        if (grade < 6) return "#ffc107"; // Mittel
+        return "#dc3545";                // Steil
+    }
+
+    // 3. Routing & Planungs-Heatmap
+    routingControl = L.Routing.control({
+        waypoints: [],
+        router: L.Routing.osrmv1({ serviceUrl: 'https://router.project-osrm.org/route/v1', profile: 'bicycle' }),
+        lineOptions: { styles: [{ opacity: 0 }] }, // Verstecke Standardlinie
+        addWaypoints: true
+    }).addTo(map);
+
+    routingControl.on('routesfound', async function(e) {
+        const route = e.routes[0];
+        const coords = route.coordinates;
+        plannedHeatmapLayer.clearLayers();
+        
+        // Hole Höhenmeter für Planung (vereinfacht für Performance)
+        const sample = coords.filter((_, i) => i % 10 === 0);
+        const elevations = await fetchElevationData(sample);
+        
+        for (let i = 1; i < sample.length; i++) {
+            const d = map.distance(sample[i-1], sample[i]);
+            const diff = elevations[i] - elevations[i-1];
+            const grade = (diff / d) * 100;
+            L.polyline([sample[i-1], sample[i]], {color: getGradeColor(grade), weight: 6}).addTo(plannedHeatmapLayer);
+        }
+    });
+
+    map.on('contextmenu', (e) => {
+        let wps = routingControl.getWaypoints();
+        let idx = wps.findIndex(wp => !wp.latLng);
+        if (idx !== -1) routingControl.spliceWaypoints(idx, 1, e.latLng);
+        else routingControl.spliceWaypoints(wps.length, 0, e.latLng);
+    });
+
+    // 4. Tracking-Logik (Speed Heatmap)
+    function startTracking() {
+        if(isRecording) return;
+        isRecording = true; startTime = new Date();
+        document.getElementById('startBtn').style.opacity = "0.5";
+        timerInterval = setInterval(updateTimer, 1000);
+
+        navigator.geolocation.watchPosition(pos => {
+            if(!isRecording) return;
+            const cur = L.latLng(pos.coords.latitude, pos.coords.longitude);
+            const speed = pos.coords.speed || 0;
+            document.getElementById('ele-speed').innerText = (speed * 3.6).toFixed(1) + " km/h";
+
+            if (lastPos) {
+                const d = map.distance(lastPos, cur);
+                if (d > 5) {
+                    totalDist += d / 1000;
+                    document.getElementById('dist').innerText = totalDist.toFixed(1);
+                    L.polyline([lastPos, cur], {color: getSpeedColor(speed), weight: 7}).addTo(map);
+                    trackPath.push({lat: cur.lat, lng: cur.lng});
+                    lastPos = cur;
+                }
+            } else { lastPos = cur; }
+        }, null, { enableHighAccuracy: true });
+    }
+
+    async function fetchElevationData(points) {
+        try {
+            const res = await fetch('https://api.open-elevation.com/api/v1/lookup', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ locations: points.map(p => ({latitude: p.lat, longitude: p.lng})) })
+            });
+            const data = await res.json();
+            return data.results.map(r => r.elevation);
+        } catch(e) { return points.map(() => 0); }
+    }
+
+    function updateTimer() {
+        const diff = Math.floor((new Date() - startTime) / 1000);
+        document.getElementById('time').innerText = Math.floor(diff/60).toString().padStart(2,'0') + ":" + (diff%60).toString().padStart(2,'0');
+    }
+
+    function stopTracking() { isRecording = false; clearInterval(timerInterval); alert("Tour gestoppt!"); }
+    
+    function resetAll() { location.reload(); }
+
+    function exportGPX() {
+        let gpx = '<?xml version="1.0" encoding="UTF-8"?><gpx version="1.1"><trk><trkseg>';
+        trackPath.forEach(p => gpx += `<trkpt lat="${p.lat}" lon="${p.lng}"></trkpt>`);
+        gpx += '</trkseg></trk></gpx>';
+        const blob = new Blob([gpx], {type: 'application/gpx+xml'});
+        const link = document.createElement('a');
+        link.href = URL.createObjectURL(blob);
+        link.download = `tour.gpx`;
+        link.click();
+    }
+</script>
+</body>
+</html>
